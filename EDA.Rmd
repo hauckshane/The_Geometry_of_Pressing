@@ -1,0 +1,703 @@
+---
+title: "EDA"
+author: "Shane Hauck"
+date: "2024-01-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(StatsBombR)
+library(xgboost)
+library(caret)
+library(pROC)
+library(ggsoccer)
+library(ggforce)
+library(progress)
+library(deldir)
+library(ggnewscale)
+```
+
+# Set Up StatsBomb 360 Data from World Cup 2022
+```{r}
+Comp <- FreeCompetitions()
+Matches <- FreeMatches(Comp)
+Matches <- Matches %>% filter(competition.competition_id == 43 & season.season_id == 106)
+data360 <- free_allevents_360(MatchesDF = Matches, Parallel = T)
+
+events <- free_allevents(MatchesDF = Matches, Parallel = T)
+events <- allclean(events)
+events <- get.opposingteam(events)
+
+data360 <- data360 %>% rename(id = event_uuid)
+events <- events %>% left_join(data360, by = c("id" = "id"))
+events <- events %>%
+  rename(match_id = match_id.x) %>%
+  select(-match_id.y)
+```
+
+# Select Relevant Columns and Pull out Freeze Frame Data
+```{r}
+single_events <- events %>%
+  select(
+    id, match_id, team.name, OpposingTeam, tactics.formation, tactics.lineup,
+    player.name, position.name, period, minute, second, play_pattern.name,
+    type.name, location.x, location.y, pass.outcome.name, pass.technique.name,
+    pass.length, pass.angle, pass.end_location.x, pass.end_location.y,
+    pass.type.name, pass.deflected, pass.height.name, pass.body_part.name,
+    pass.through_ball, pass.switch, pass.recipient.id, pass.recipient.name,
+    pass.outcome.id, pass.technique.id, pass.type.id, pass.height.id, pass.body_part.id,
+    duel.type.name, duel.outcome.name, interception.outcome.name, under_pressure,
+    counterpress, DefendersBehindBall, DistToGoal, AngleToGoal, TimeInPoss,
+    TimeToPossEnd, duration, freeze_frame
+  )
+
+ffs <- single_events %>%
+  mutate(ff_id = row_number()) %>%
+  # by match_id and team.name fill in the missing values for tactics.formation and tactics.lineup
+  group_by(match_id, team.name) %>%
+  fill(tactics.formation, tactics.lineup, .direction = "updown") %>%
+  ungroup() %>%
+  unnest(freeze_frame) %>%
+  mutate(ff_location.x = (map(location, 1)), ff_location.y = (map(location, 2))) %>%
+  select(-location) %>%
+  mutate(
+    ff_location.x = as.numeric(ifelse(
+      ff_location.x == "NULL", NA, ff_location.x
+    )),
+    ff_location.y = as.numeric(ifelse(ff_location.y == "NULL", NA, ff_location.y))
+  )
+```
+
+
+# Create Pass Difficulty Model
+```{r}
+# Standardize x and y coordinates so offences are always attacking from left to right
+ffs_standardized <- ffs %>%
+  group_by(match_id, period) %>%
+  mutate(AttackingRightToLeft = ifelse(
+    sum(ff_location.x > 60 & minute == min(minute) & second == min(second[minute == min(minute)])) >
+      sum(ff_location.x < 60 & minute == min(minute) & second == min(second[minute == min(minute)])),
+    1,
+    0
+  )) %>%
+  mutate_at(vars(contains(".x")), funs(ifelse(AttackingRightToLeft == 1 & period == 1, 120 - ., .))) %>%
+  mutate_at(vars(contains(".y")), funs(ifelse(AttackingRightToLeft == 1 & period == 1, 80 - ., .))) %>%
+  mutate_at(vars(contains(".x")), funs(ifelse(AttackingRightToLeft == 0 & period == 2, 120 - ., .))) %>%
+  mutate_at(vars(contains(".y")), funs(ifelse(AttackingRightToLeft == 0 & period == 2, 80 - ., .))) %>%
+  ungroup()
+
+# Create a dataframe of only passes
+df_passes <- ffs_standardized %>%
+  filter(type.name == "Pass") %>%
+  filter(is.na(pass.type.name)) %>%
+  distinct(
+    ff_id, pass.outcome.id, location.x, location.y, pass.end_location.x, pass.end_location.y,
+    pass.height.id, pass.body_part.id,
+  ) %>%
+  mutate(
+    pass.outcome.id = ifelse(is.na(pass.outcome.id), 1, pass.outcome.id),
+    pass.outcome.id = case_when(
+      pass.outcome.id == 9 ~ 0,
+      pass.outcome.id == 75 ~ 0,
+      pass.outcome.id == 76 ~ 0,
+      pass.outcome.id == 1 ~ 1,
+      TRUE ~ NA
+    ),
+    pass.height.id = as.factor(pass.height.id),
+    pass.body_part.id = as.factor(pass.body_part.id)
+  ) %>%
+  na.omit()
+```
+
+# Voronoi Diagrams or (Thiessen Polygones)
+```{r}
+passes_in_def_3rd <- df_passes %>%
+  filter(location.x <= 40) %>%
+  pull(ff_id)
+
+freezeframes <- unique(c(passes_in_def_3rd))
+
+
+tesselations <- data.frame()
+
+# Create a new progress bar
+pb <- progress_bar$new(
+  format = "[:bar] :current/:total (:percent) in :elapsed, eta: :eta",
+  total = length(freezeframes), clear = FALSE, width = 60
+)
+
+for (freezeframe in freezeframes) {
+  tryCatch(
+    {
+      oneframe <- ffs_standardized %>% filter(ff_id == freezeframe)
+      oneframeX <- oneframe$ff_location.x
+      oneframeY <- oneframe$ff_location.y
+      tesselation <- deldir(oneframeX, oneframeY)
+      oneframe <- mutate(oneframe, tesselation$summary)
+      tesselations <- rbind(tesselations, oneframe)
+    },
+    error = function(e) {}
+  )
+
+  # Update the progress bar
+  pb$tick()
+}
+
+write.csv(tesselations %>% select(-tactics.lineup), "tesselations.csv")
+```
+
+
+# Modeling for F-Test
+```{r}
+full_df <- left_join(tesselations, df_passes %>% select(ff_id, passdifficulty))
+
+forward_passes <- ffs_standardized %>%
+  filter(pass.end_location.x > location.x) %>%
+  distinct(ff_id) %>%
+  pull()
+
+def_forward_passes <- full_df %>%
+  filter(ff_id %in% forward_passes) %>%
+  filter(actor == TRUE) %>%
+  mutate(
+    pass.outcome.id = ifelse(is.na(pass.outcome.id), 1, pass.outcome.id),
+    pass.outcome.id = case_when(
+      pass.outcome.id == 9 ~ 0,
+      pass.outcome.id == 75 ~ 0,
+      pass.outcome.id == 76 ~ 0,
+      pass.outcome.id == 1 ~ 1,
+      TRUE ~ NA
+    )
+  )
+
+ballRecipient_df <- full_df %>%
+  filter(ff_id %in% forward_passes) %>%
+  filter(ff_id %in% passes_in_def_3rd) %>%
+  filter(teammate == TRUE) %>%
+  group_by(ff_id) %>%
+  mutate(closest = ifelse(
+    sqrt((pass.end_location.x - x)^2 + (pass.end_location.y - y)^2) ==
+      min(sqrt((pass.end_location.x - x)^2 + (pass.end_location.y - y)^2)),
+    TRUE,
+    FALSE
+  )) %>%
+  filter(closest == TRUE) %>%
+  select(ff_id, x, y, n.tri, del.area, del.wts, n.tside, nbpt, dir.area, dir.wts) %>%
+  rename_with(~ paste0("ballRecipient_", .), -ff_id)
+
+modeling_df <- left_join(def_forward_passes, ballRecipient_df, by = "ff_id") %>%
+  select(
+    passdifficulty, pass.outcome.id, play_pattern.name, location.x, location.y,
+    pass.end_location.x, pass.end_location.y,
+    pass.length, pass.height.id, pass.body_part.id, TimeInPoss, duration,
+    n.tri, del.area, del.wts, n.tside, nbpt, dir.area, dir.wts,
+    ballRecipient_x, ballRecipient_y, ballRecipient_n.tri, ballRecipient_del.area,
+    ballRecipient_del.wts, ballRecipient_n.tside, ballRecipient_nbpt,
+    ballRecipient_dir.area, ballRecipient_dir.wts
+  ) %>%
+  na.omit()
+
+
+modeling_df %>%
+  ggplot(aes(x = (passdifficulty)^3)) +
+  geom_histogram()
+
+modeling_df %>%
+  ggplot(aes(x = sqrt(dir.area))) +
+  geom_histogram()
+modeling_df %>%
+  ggplot(aes(x = sqrt(del.area))) +
+  geom_histogram()
+modeling_df %>%
+  ggplot(aes(x = sqrt(dir.wts))) +
+  geom_histogram()
+modeling_df %>%
+  ggplot(aes(x = sqrt(del.wts))) +
+  geom_histogram()
+
+modeling_df %>%
+  ggplot(aes(x = log(del.area), y = (passdifficulty)^4)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm") +
+  labs(x = "Directional Weight", y = "Pass Difficulty", title = "Directional Weight vs Pass Difficulty") +
+  theme_minimal()
+
+
+mod <- glm(
+  pass.outcome.id ~
+    sqrt(del.area) + sqrt(del.wts) +
+    sqrt(n.tri) + sqrt(n.tside) +
+    sqrt(dir.area):sqrt(nbpt) + sqrt(dir.wts):sqrt(nbpt) +
+    sqrt(TimeInPoss) + sqrt(duration) +
+    sqrt(duration):sqrt(del.area) +
+    location.x +
+    location.x:pass.end_location.x +
+    as.factor(pass.height.id) + as.factor(pass.body_part.id),
+  modeling_df,
+  family = binomial(link = "probit")
+)
+summary(mod)
+
+nullmod <- glm(
+  pass.outcome.id ~
+    sqrt(TimeInPoss) + sqrt(duration) +
+    location.x +
+    location.x:pass.end_location.x +
+    as.factor(pass.height.id) + as.factor(pass.body_part.id),
+  modeling_df,
+  family = binomial(link = "probit")
+)
+summary(nullmod)
+
+
+anova(mod, nullmod, test = "Chisq")
+
+anova(mod, test = "Chisq")
+
+varImp(mod)
+
+modeling_df <- modeling_df %>% mutate(passdifficulty = predict(mod, type = "response"))
+```
+
+# Create calibration plot
+
+```{r}
+# Generate predicted probabilities
+modeling_df$transformed_sqrt_del_area <- sqrt(modeling_df$del.area)
+modeling_df$transformed_sqrt_del_wts <- sqrt(modeling_df$del.wts)
+modeling_df$transformed_sqrt_n_tri <- sqrt(modeling_df$n.tri)
+modeling_df$transformed_sqrt_n_tside <- sqrt(modeling_df$n.tside)
+modeling_df$transformed_sqrt_dir_area <- sqrt(modeling_df$dir.area)
+modeling_df$transformed_sqrt_nbpt <- sqrt(modeling_df$nbpt)
+modeling_df$transformed_sqrt_TimeInPoss <- sqrt(modeling_df$TimeInPoss)
+modeling_df$transformed_sqrt_duration <- sqrt(modeling_df$duration)
+
+# Generate predicted probabilities for 'mod'
+modeling_df$pred_mod <- predict(mod, newdata = modeling_df, type = "response")
+
+# Generate predicted probabilities for 'nullmod'
+# 'nullmod' does not require transformations as per your model formula
+modeling_df$pred_nullmod <- predict(nullmod, newdata = modeling_df, type = "response")
+
+# Function to create binned data
+create_binned_data <- function(predictions, actual, bins = 10) {
+  cut_points <- quantile(predictions, probs = seq(0, 1, length.out = bins + 1))
+  binned_data <- data.frame(
+    Bin = cut(predictions, breaks = cut_points, include.lowest = TRUE),
+    Prediction = predictions,
+    Actual = actual
+  ) %>%
+  group_by(Bin) %>%
+  summarise(
+    MeanPrediction = mean(Prediction),
+    Observed = mean(Actual),
+    N = n(),
+    SE = sqrt(Observed * (1 - Observed) / N)  # Standard error calculation
+  )
+  return(binned_data)
+}
+
+# Create binned data for both models
+binned_mod <- create_binned_data(modeling_df$pred_mod, modeling_df$pass.outcome.id)
+binned_nullmod <- create_binned_data(modeling_df$pred_nullmod, modeling_df$pass.outcome.id)
+
+# Combine data for plotting
+plot_data <- rbind(
+  mutate(binned_mod, Model = "mod"),
+  mutate(binned_nullmod, Model = "nullmod")
+)
+
+# Calibration plot with error bars
+ggplot(plot_data, aes(x = MeanPrediction, y = Observed, color = Model)) +
+  geom_line(lwd = 2) +
+  geom_errorbar(aes(ymin = Observed - SE, ymax = Observed + SE), width = 0.01, size = 1.5) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(x = "Predicted Probability", y = "Observed Proportion", title = "Model Calibration Plot",
+       subtitle = "Our model with the spatial metrics included performs slightly more consistent at predicting the probability that a pass will be completed.") +
+  theme_minimal()
+
+```
+
+
+
+# Create Space Distribution Plot
+
+
+# Deluany plot (ball player)
+```{r}
+plot_data <- modeling_df %>%
+  select(passdifficulty, del.area) %>%
+  mutate(del.area_log = sqrt(del.area)) %>%
+  mutate(del.area_log_bin = ntile(del.area_log, 5)) %>%
+  group_by(del.area_log_bin) %>%
+  summarise(min_del_area = min(del.area_log),
+         max_del_area = max(del.area_log),
+         mean_passdifficulty = mean(passdifficulty)) %>%
+  mutate(bin_id = as.numeric(del.area_log_bin))
+
+library(gt)
+
+
+table_data <- plot_data %>% select(min_del_area, max_del_area, mean_passdifficulty) %>%
+  mutate(`Del.Area Range` = paste0(round(min_del_area, 2), " - ", round(max_del_area, 2))) %>%
+  select(`Del.Area Range`, mean_passdifficulty) %>%
+  rename(`Mean Pass Difficulty` = mean_passdifficulty)
+
+table_data %>% gt() %>%
+  data_color(
+    columns = vars(`Mean Pass Difficulty`),
+    colors = scales::col_numeric(
+      palette = c("dodgerblue3", "firebrick"),
+      domain = range(table_data$`Mean Pass Difficulty`, na.rm = TRUE)
+    )
+  )
+
+# Define the number of sides for the polygons
+n_sides <- 5
+
+# Function to generate the vertices of a symmetrical polygon
+generate_polygon_data <- function(size_ratio, mean_passdifficulty) {
+  tibble(
+    x = size_ratio * cos(seq(0, 2 * pi, length.out = n_sides + 1)),
+    y = size_ratio * sin(seq(0, 2 * pi, length.out = n_sides + 1)),
+    mean_passdifficulty = mean_passdifficulty
+  )
+}
+
+# Generate the data for polygons with size ratios 1/5, 2/5, ..., 5/5
+polygons_data <- lapply(1:5, function(i) {
+  generate_polygon_data(size_ratio = i / 5, mean_passdifficulty = plot_data$mean_passdifficulty[i])
+})
+
+ggplot() +
+  geom_polygon(data = polygons_data[[5]], aes(x = x, y = y, fill = mean_passdifficulty), color = "grey") +
+  geom_segment(data = polygons_data[[5]], aes(x = 0, y = 0, xend = x, yend = y), color = "grey", alpha = .5) +
+  geom_point(data = polygons_data[[5]], aes(x = x, y = y), size = 2) +
+  geom_polygon(data = polygons_data[[4]], aes(x = x, y = y, fill = mean_passdifficulty), color = "grey") +
+  geom_segment(data = polygons_data[[4]], aes(x = 0, y = 0, xend = x, yend = y), color = "grey", alpha = .5) +
+  geom_point(data = polygons_data[[4]], aes(x = x, y = y), size = 2) +
+  geom_polygon(data = polygons_data[[3]], aes(x = x, y = y, fill = mean_passdifficulty), color = "grey") +
+  geom_segment(data = polygons_data[[3]], aes(x = 0, y = 0, xend = x, yend = y), color = "grey", alpha = .5) +
+  geom_point(data = polygons_data[[3]], aes(x = x, y = y), size = 2) +
+  geom_polygon(data = polygons_data[[2]], aes(x = x, y = y, fill = mean_passdifficulty), color = "grey") +
+  geom_segment(data = polygons_data[[2]], aes(x = 0, y = 0, xend = x, yend = y), color = "grey", alpha = .5) +
+  geom_point(data = polygons_data[[2]], aes(x = x, y = y), size = 2) +
+  geom_polygon(data = polygons_data[[1]], aes(x = x, y = y, fill = mean_passdifficulty), color = "grey") +
+  geom_segment(data = polygons_data[[1]], aes(x = 0, y = 0, xend = x, yend = y), color = "grey", alpha = .5) +
+  geom_point(data = polygons_data[[1]], aes(x = x, y = y), size = 2) +
+  scale_fill_gradient2(low = "dodgerblue", mid = "dodgerblue4", high = "firebrick", limits = c(.62, .95), midpoint = .76) +
+  geom_point(data = tibble(x = 0, y = 0), aes(x = x, y = y), color = "black", size = 3) +
+  geom_segment(aes(x = 0, y = 0, xend = 0.5, yend = 0.5),
+    arrow = arrow(length = unit(0.5, "cm")), lwd = 2, color = "black"
+  ) +
+  # write text on top of the arrow that says "Ball Player Area of Space" angle that it is at 45 degree angle
+  annotate("text",
+    x = 0, y = 0.025, label = "Ball Player Area of Space",
+    hjust = 0, vjust = 0, size = 6, color = "black", fontface = "bold", angle = 45
+  ) +
+  coord_equal() +
+  coord_fixed() +
+  theme_void() +
+  theme(legend.key.size = unit(3, "cm")) +
+  labs(
+    fill = "Pass Difficulty",
+    title = "Pass Difficulty Given How Much Space the Ball Player Has at Time of Pass",
+    subtitle = "The more condensed the area of space that the ball player owns, the more difficult the pass is (Considering Delauny Triangulations).",
+    caption = "Data: StatsBomb"
+  ) +
+  # Increase size of title
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 15)
+  )
+```
+
+# Dirichlet plot (ball player)
+```{r}
+plot_data <- modeling_df %>%
+  select(passdifficulty, dir.area) %>%
+  mutate(del.area_log = sqrt(dir.area)) %>%
+  mutate(del.area_log_bin = ntile(del.area_log, 5)) %>%
+  group_by(del.area_log_bin) %>%
+  summarise(min_del_area = min(del.area_log),
+         max_del_area = max(del.area_log),
+         mean_passdifficulty = mean(passdifficulty)) %>%
+  mutate(bin_id = as.numeric(del.area_log_bin))
+
+table_data <- plot_data %>% select(min_del_area, max_del_area, mean_passdifficulty) %>%
+  mutate(`Dir.Area Range` = paste0(round(min_del_area, 2), " - ", round(max_del_area, 2))) %>%
+  select(`Dir.Area Range`, mean_passdifficulty) %>%
+  rename(`Mean Pass Difficulty` = mean_passdifficulty)
+
+table_data %>% gt() %>%
+  data_color(
+    columns = vars(`Mean Pass Difficulty`),
+    colors = scales::col_numeric(
+      palette = c("dodgerblue3", "firebrick"),
+      domain = range(table_data$`Mean Pass Difficulty`, na.rm = TRUE)
+    )
+  )
+
+# Define the number of sides for the polygons
+n_sides <- 5
+
+# Function to generate the vertices of a symmetrical polygon
+generate_polygon_data <- function(size_ratio, mean_passdifficulty) {
+  tibble(
+    x = size_ratio * cos(seq(0, 2 * pi, length.out = n_sides + 1)),
+    y = size_ratio * sin(seq(0, 2 * pi, length.out = n_sides + 1)),
+    mean_passdifficulty = mean_passdifficulty
+  )
+}
+
+# Generate the data for polygons with size ratios 1/5, 2/5, ..., 5/5
+polygons_data <- lapply(1:5, function(i) {
+  generate_polygon_data(size_ratio = i / 5, mean_passdifficulty = plot_data$mean_passdifficulty[i])
+})
+
+ggplot() +
+  geom_polygon(data = polygons_data[[5]], aes(x = x, y = y, fill = mean_passdifficulty), color = "grey") +
+  geom_segment(data = polygons_data[[5]], aes(x = 0, y = 0, xend = x, yend = y), color = "grey", alpha = .5) +
+  geom_point(data = polygons_data[[5]], aes(x = x, y = y), size = 2) +
+  geom_polygon(data = polygons_data[[4]], aes(x = x, y = y, fill = mean_passdifficulty), color = "grey") +
+  geom_segment(data = polygons_data[[4]], aes(x = 0, y = 0, xend = x, yend = y), color = "grey", alpha = .5) +
+  geom_point(data = polygons_data[[4]], aes(x = x, y = y), size = 2) +
+  geom_polygon(data = polygons_data[[3]], aes(x = x, y = y, fill = mean_passdifficulty), color = "grey") +
+  geom_segment(data = polygons_data[[3]], aes(x = 0, y = 0, xend = x, yend = y), color = "grey", alpha = .5) +
+  geom_point(data = polygons_data[[3]], aes(x = x, y = y), size = 2) +
+  geom_polygon(data = polygons_data[[2]], aes(x = x, y = y, fill = mean_passdifficulty), color = "grey") +
+  geom_segment(data = polygons_data[[2]], aes(x = 0, y = 0, xend = x, yend = y), color = "grey", alpha = .5) +
+  geom_point(data = polygons_data[[2]], aes(x = x, y = y), size = 2) +
+  geom_polygon(data = polygons_data[[1]], aes(x = x, y = y, fill = mean_passdifficulty), color = "grey") +
+  geom_segment(data = polygons_data[[1]], aes(x = 0, y = 0, xend = x, yend = y), color = "grey", alpha = .5) +
+  geom_point(data = polygons_data[[1]], aes(x = x, y = y), size = 2) +
+  scale_fill_gradient2(low = "dodgerblue", mid = "dodgerblue4", high = "firebrick", limits = c(.62, .95), midpoint = .76) +
+  geom_point(data = tibble(x = 0, y = 0), aes(x = x, y = y), color = "black", size = 3) +
+  geom_segment(aes(x = 0, y = 0, xend = 0.5, yend = 0.5),
+    arrow = arrow(length = unit(0.5, "cm")), lwd = 2, color = "black"
+  ) +
+  # write text on top of the arrow that says "Ball Player Area of Space" angle that it is at 45 degree angle
+  annotate("text",
+    x = 0, y = 0.025, label = "Ball Player Area of Space",
+    hjust = 0, vjust = 0, size = 6, color = "black", fontface = "bold", angle = 45
+  ) +
+  coord_equal() +
+  coord_fixed() +
+  theme_void() +
+  theme(legend.key.size = unit(3, "cm")) +
+  labs(
+    fill = "Pass Difficulty",
+    title = "Pass Difficulty Given How Much Space the Ball Player Has at Time of Pass",
+    subtitle = "The more condensed the area of space that the ball player owns, the more difficult the pass is (Considering Voronoi Diagrams)."
+  ) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 15)
+  )
+```
+
+
+
+# Create Pitch Plots
+```{r}
+plotting_df <- full_df %>%
+  filter(ff_id %in% forward_passes)
+
+
+
+test_play <- plotting_df %>%
+  filter(ff_id == 45507) %>%
+  select(x, y, teammate, location.x, location.y, pass.end_location.x, pass.end_location.y, passdifficulty) %>%
+  mutate(isteammate = ifelse(teammate == "TRUE", 1, 0))
+
+
+
+ggplot(test_play, aes(x, y)) +
+  annotate_pitch(dimensions = pitch_statsbomb, colour = "black", fill = "white") +
+  theme_pitch() +
+  geom_point(aes(color = teammate), alpha = 1, size = 7) +
+  geom_voronoi_tile(aes(x, y, fill = isteammate), alpha = .5, bound = c(0, 120, 0, 80)) +
+  geom_voronoi_segment(color = "white", bound = c(0, 120, 0, 80)) +
+  scale_fill_gradient(low = "purple", high = "gold") +
+  scale_color_manual(values = c("purple4", "gold4")) +
+  guides(fill = FALSE) +
+  new_scale_colour() +
+  geom_segment(
+    data = test_play, aes(
+      x = location.x, y = location.y,
+      xend = pass.end_location.x, yend = pass.end_location.y, color = passdifficulty
+    ),
+    size = 3, lineend = "round", arrow = arrow(length = unit(0.10, "inches")),
+    stat = "identity", position = "identity"
+  ) +
+  scale_color_gradient2(low = "dodgerblue", mid = "dodgerblue4", high = "firebrick", limits = c(0, 1), midpoint = .5)  +
+  labs(
+    title = "Play Example of Pass Difficulty with Voronoi Diagrams",
+    subtitle = "The ball player owns alot of space, so the pass is easy and likely to be completed.",
+    x = "Attacking Direction from Left to Right",
+    color = "Expected Pass Completion\nProbability"
+  ) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 15),
+    axis.title.x = element_text(size = 20)) +
+  theme(legend.key.size = unit(3, "cm")) 
+
+
+
+ggplot(test_play, aes(x, y)) +
+  annotate_pitch(dimensions = pitch_statsbomb, colour = "black", fill = "#a8bc95") +
+  theme_pitch() +
+  geom_delaunay_tile(aes(x, y), fill = "grey", alpha = .5, bound = c(0, 120, 0, 80)) +
+  geom_delaunay_segment(color = "white", bound = c(0, 120, 0, 80)) +
+  geom_delaunay_tile(data = test_play %>% top_n(-6,x),
+                     aes(x, y), fill = "gold", alpha = .5, bound = c(0, 120, 0, 80)) +
+  geom_point(aes(color = teammate), alpha = 0.7, size = 7) +
+  scale_fill_gradient(low = "purple", high = "gold") +
+  scale_color_manual(values = c("purple4", "gold4")) +
+  new_scale_colour() +
+  geom_segment(
+    data = test_play, aes(
+      x = location.x, y = location.y,
+      xend = pass.end_location.x, yend = pass.end_location.y, color = passdifficulty
+    ),
+    size = 3, lineend = "round", arrow = arrow(length = unit(0.10, "inches")),
+    stat = "identity", position = "identity"
+  ) +
+  scale_color_gradient2(low = "dodgerblue", mid = "dodgerblue4", high = "firebrick", limits = c(0, 1), midpoint = .5)  +
+  labs(
+    title = "Play Example of Pass Difficulty with Delaunay Triangulation",
+    subtitle = "The ball players area of space is not being greatly affected by other players, resulting in an easier pass with high completion %.",
+    x = "Attacking Direction from Left to Right",
+    color = "Expected Pass Completion\nProbability"
+  ) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 15),
+    axis.title.x = element_text(size = 20)) +
+  theme(legend.key.size = unit(3, "cm")) 
+
+
+test_play <- plotting_df %>%
+  filter(ff_id == 199237) %>%
+  select(x, y, teammate, location.x, location.y, pass.end_location.x, pass.end_location.y, passdifficulty) %>%
+  mutate(isteammate = ifelse(teammate == "TRUE", 1, 0))
+
+ggplot(test_play, aes(x, y)) +
+  annotate_pitch(dimensions = pitch_statsbomb, colour = "black", fill = "white") +
+  theme_pitch() +
+  geom_point(aes(color = teammate), alpha = 1, size = 7) +
+  geom_voronoi_tile(aes(x, y, fill = isteammate), alpha = .5, bound = c(0, 120, 0, 80)) +
+  geom_voronoi_segment(color = "white", bound = c(0, 120, 0, 80)) +
+  scale_fill_gradient(low = "purple", high = "gold") +
+  scale_color_manual(values = c("purple4", "gold4")) +
+  guides(fill = FALSE) +
+  new_scale_colour() +
+  geom_segment(
+    data = test_play, aes(
+      x = location.x, y = location.y,
+      xend = pass.end_location.x, yend = pass.end_location.y, color = passdifficulty
+    ),
+    size = 3, lineend = "round", arrow = arrow(length = unit(0.10, "inches")),
+    stat = "identity", position = "identity"
+  ) +
+  scale_color_gradient2(low = "dodgerblue", mid = "dodgerblue4", high = "firebrick", limits = c(0, 1), midpoint = .5)  +
+  labs(
+    title = "Play Example of Pass Difficulty with Voronoi Diagrams",
+    subtitle = "The ball player owns a small amount of space, so the pass is difficult and unlikely to be completed.",
+    x = "Attacking Direction from Left to Right",
+    color = "Expected Pass Completion\nProbability"
+  ) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 15),
+    axis.title.x = element_text(size = 20)) +
+  theme(legend.key.size = unit(3, "cm")) 
+
+
+ggplot(test_play, aes(x, y)) +
+  annotate_pitch(dimensions = pitch_statsbomb, colour = "black", fill = "#a8bc95") +
+  theme_pitch() +
+  geom_delaunay_tile(aes(x, y), fill = "grey", alpha = .5, bound = c(0, 120, 0, 80)) +
+  geom_delaunay_segment(color = "white", bound = c(0, 120, 0, 80)) +
+  geom_delaunay_tile(data = test_play %>% top_n(-3,y),
+                     aes(x, y), fill = "gold", alpha = .5, bound = c(0, 120, 0, 80)) +
+  geom_point(aes(color = teammate), alpha = 0.7, size = 7) +
+  scale_fill_gradient(low = "purple", high = "gold") +
+  scale_color_manual(values = c("purple4", "gold4")) +
+  new_scale_colour() +
+  geom_segment(
+    data = test_play, aes(
+      x = location.x, y = location.y,
+      xend = pass.end_location.x, yend = pass.end_location.y, color = passdifficulty
+    ),
+    size = 3, lineend = "round", arrow = arrow(length = unit(0.10, "inches")),
+    stat = "identity", position = "identity"
+  ) +
+  scale_color_gradient2(low = "dodgerblue", mid = "dodgerblue4", high = "firebrick", limits = c(0, 1), midpoint = .5) +
+  labs(
+    title = "Play Example of Pass Difficulty with Delaunay Triangulation",
+    subtitle = "The ball players area of space is being greatly affected by other players, resulting in a harder pass with low completion %.",
+    x = "Attacking Direction from Left to Right",
+    color = "Expected Pass Completion\nProbability"
+  ) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 15),
+    axis.title.x = element_text(size = 20)) +
+  theme(legend.key.size = unit(3, "cm")) 
+```
+
+
+# Plot all passes
+
+```{r}
+kmeans_model <- kmeans(
+  modeling_df %>% select(
+    location.x, location.y,
+    pass.end_location.x, pass.end_location.y, passdifficulty
+  ),
+  centers = 30
+)
+
+cluster_centers <- as.data.frame(kmeans_model$centers)
+colnames(cluster_centers) <- c("location.x", "location.y", "pass.end_location.x", "pass.end_location.y", "passdifficulty")
+
+ggplot(data = modeling_df) +
+  annotate_pitch(dimensions = pitch_statsbomb, colour = "black", fill = "#a8bc95") +
+  theme_pitch() +
+  geom_segment(
+    aes(
+      x = location.x, y = location.y,
+      xend = pass.end_location.x, yend = pass.end_location.y
+    ),
+    lineend = "round", size = .5, arrow = arrow(length = unit(0.10, "inches")),
+    stat = "identity", position = "identity", alpha = 0.05
+  ) +
+  geom_segment(
+    data = cluster_centers, aes(
+      x = location.x, y = location.y,
+      xend = pass.end_location.x, yend = pass.end_location.y, color = passdifficulty
+    ),
+    size = 3, lineend = "round", arrow = arrow(length = unit(0.10, "inches")),
+    stat = "identity", position = "identity"
+  ) +
+  scale_color_gradient2(low = "dodgerblue", mid = "dodgerblue4", high = "firebrick", limits = c(.25, 1), midpoint = .6) +
+  labs(title = "Pass Difficulty of Forward Passes Coming from Defensive 3rd",
+       x = "Attacking Direction from Left to Right",
+       color = "Expected Pass Completion\nProbability",
+       subtitle = "Clustered Pass Trajectories and Associated Completion Probabilities") +
+  theme(legend.key.size = unit(3, "cm")) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 15),
+    axis.title.x = element_text(size = 20)) 
+  
+  
+```
+
